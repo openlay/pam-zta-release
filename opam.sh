@@ -4,6 +4,13 @@
 # Single-script installer/updater for the control gateway. Runs locally on
 # the target Linux server, or remotely from your laptop via SSH.
 #
+# Source: https://github.com/openlay/pam-zta-release
+# Script-only fast path:
+#   curl -fsSL https://raw.githubusercontent.com/openlay/pam-zta-release/main/opam.sh \
+#     -o opam.sh && chmod +x opam.sh
+#   sudo ./opam.sh install --domain gw.example.com --tls autocert
+# (binaries are auto-fetched on demand if not already present locally)
+#
 # Usage:
 #   ./opam.sh install [OPTIONS] [user@host]
 #   ./opam.sh update  [OPTIONS] [user@host]
@@ -19,6 +26,11 @@ set -euo pipefail
 SCRIPT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 RELEASE_DIR=$(dirname "$SCRIPT_PATH")
 GATEWAY_DIR=$RELEASE_DIR/gateway
+
+# GitHub fetch fallback. Override with OPAM_RELEASE_REF=tag-or-branch.
+RELEASE_REPO=${OPAM_RELEASE_REPO:-openlay/pam-zta-release}
+RELEASE_REF=${OPAM_RELEASE_REF:-main}
+RELEASE_BASE_URL="https://raw.githubusercontent.com/$RELEASE_REPO/$RELEASE_REF"
 
 INSTALL_PREFIX=/opt/pam-zta
 BIN_DIR=$INSTALL_PREFIX/bin
@@ -143,6 +155,36 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || err "Missing required command: $1"
 }
 
+# Download a release file (gateway/<name> or gateway/gateway.example.toml)
+# into RELEASE_DIR if not already present. Echoes the resolved local path.
+fetch_release_file() {
+  local relpath=$1                     # e.g. "gateway/gateway-linux-amd64"
+  local local_path="$RELEASE_DIR/$relpath"
+  if [[ -f $local_path ]]; then
+    echo "$local_path"
+    return
+  fi
+  install -d "$(dirname "$local_path")"
+  local url="$RELEASE_BASE_URL/$relpath"
+  log "Fetching $relpath from $RELEASE_REPO@$RELEASE_REF…" >&2
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --progress-bar "$url" -o "$local_path" >&2 \
+      || err "Download failed: $url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --show-progress "$url" -O "$local_path" >&2 \
+      || err "Download failed: $url"
+  else
+    err "Need curl or wget to download. Or clone https://github.com/$RELEASE_REPO manually."
+  fi
+  [[ $relpath == gateway/gateway-* ]] && chmod +x "$local_path"
+  echo "$local_path"
+}
+
+ensure_binary() {
+  local os=$1 arch=$2
+  fetch_release_file "gateway/$(binary_for_host "$os" "$arch")"
+}
+
 # ---------- QR ----------
 ensure_qrencode() {
   if command -v qrencode >/dev/null 2>&1; then return; fi
@@ -248,15 +290,16 @@ run_remote() {
   esac
   ok "Remote: $remote_os/$remote_arch"
 
-  local remote_bin="$GATEWAY_DIR/$(binary_for_host "$remote_os" "$remote_arch")"
-  [[ -f $remote_bin ]] || err "Missing binary: $remote_bin"
+  local remote_bin example_toml
+  remote_bin=$(ensure_binary "$remote_os" "$remote_arch")
+  example_toml=$(fetch_release_file "gateway/gateway.example.toml")
 
   local stage=/tmp/opam-$$
   log "Staging script + binary to $REMOTE_TARGET:$stage"
   ssh "${SSHA[@]}" "$REMOTE_TARGET" "mkdir -p $stage/gateway"
   scp "${SSHA[@]}" -q "$SCRIPT_PATH" "$REMOTE_TARGET:$stage/opam.sh"
   scp "${SSHA[@]}" -q "$remote_bin" "$REMOTE_TARGET:$stage/gateway/$(basename "$remote_bin")"
-  scp "${SSHA[@]}" -q "$GATEWAY_DIR/gateway.example.toml" "$REMOTE_TARGET:$stage/gateway/gateway.example.toml"
+  scp "${SSHA[@]}" -q "$example_toml" "$REMOTE_TARGET:$stage/gateway/gateway.example.toml"
 
   log "Running 'opam $subcommand' on remote (sudo)…"
   ssh -t "${SSHA[@]}" "$REMOTE_TARGET" \
@@ -380,8 +423,7 @@ generate_self_signed_cert() {
 install_binary() {
   local os arch src
   os=$(detect_os); arch=$(detect_arch)
-  src=$GATEWAY_DIR/$(binary_for_host "$os" "$arch")
-  [[ -f $src ]] || err "Binary not found: $src"
+  src=$(ensure_binary "$os" "$arch")
   log "Installing $src → $BIN_DIR/gateway"
   install -m 0755 "$src" "$BIN_DIR/gateway"
 
@@ -586,8 +628,9 @@ cmd_update() {
   require_root
   local os arch src
   os=$(detect_os); arch=$(detect_arch)
-  src=$GATEWAY_DIR/$(binary_for_host "$os" "$arch")
-  [[ -f $src ]] || err "Binary not found: $src"
+  # Force re-fetch on update so we pull the current ref's binary
+  rm -f "$GATEWAY_DIR/$(binary_for_host "$os" "$arch")"
+  src=$(ensure_binary "$os" "$arch")
 
   if cmp -s "$src" "$BIN_DIR/gateway" 2>/dev/null; then
     ok "Already up to date"

@@ -30,11 +30,38 @@ This release repo contains:
 
 ---
 
+## Get the release
+
+The release artifacts live at <https://github.com/openlay/pam-zta-release>.
+Pick whichever transport is easiest:
+
+```bash
+# Option 1 — git clone (preferred; works for both local and remote install paths)
+git clone https://github.com/openlay/pam-zta-release.git
+cd pam-zta-release
+
+# Option 2 — tarball (no git required)
+curl -sL https://github.com/openlay/pam-zta-release/archive/refs/heads/main.tar.gz \
+  | tar xz && cd pam-zta-release-main
+
+# Option 3 — script-only fast path (downloads gateway binary on demand)
+curl -fsSL https://raw.githubusercontent.com/openlay/pam-zta-release/main/opam.sh \
+  -o opam.sh && chmod +x opam.sh
+sudo ./opam.sh install --domain gw.example.com --tls autocert
+```
+
+The CA + OSH installers (`ca/ZTA-CaSetup.exe`, `osh/ZTA-OSHSetup.exe`) can be
+downloaded directly from the GitHub release page if you only need them — see
+Steps 7 and 12 below.
+
+---
+
 ## Quick install (Linux server)
 
 `opam.sh` automates the gateway install end-to-end: provisions the Postgres
 user/db, generates the CA token, writes config, installs a systemd unit, starts
-the service, and prints an enrollment QR for AppSigner.
+the service, and prints an enrollment QR for AppSigner. If the gateway binary
+isn't present locally, `opam.sh` fetches it from GitHub on demand.
 
 ```bash
 # Run on the gateway server
