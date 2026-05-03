@@ -1,13 +1,64 @@
-# pam-zta Gateway — Operator Setup Guide
+# pam-zta — Operator Setup Guide
 
-Zero-trust SSH PAM control plane. The gateway brokers between three actors:
+Zero-trust SSH PAM. Short-lived SSH certs minted only after a multi-step
+approval flow signed by hardware-backed keys. The system has four roles:
 
 - **OSH SSH clients** — what end users run to start an approved SSH session
 - **AppSigner (iOS)** — what approvers (admins) use to authorize requests via Touch ID
 - **CA service** — the only component that holds a signing key; mints SSH certs
+- **Target SSH hosts** — where users actually log in; `sshd` trusts the CA's
+  public key via `TrustedUserCAKeys`
 
 The gateway holds **no signing key**. Root-of-trust lives in the iOS signer's
 Secure Enclave + the CA service's signing key.
+
+This release repo contains:
+
+```
+.
+├── opam.sh                      Operator console — install / update / set-root
+├── gateway/                     Cross-compiled control-gateway binaries + config
+│   ├── gateway-linux-amd64
+│   ├── gateway-linux-arm64
+│   ├── gateway-darwin-arm64
+│   ├── gateway-windows-amd64.exe
+│   └── gateway.example.toml
+├── ca/ZTA-CaSetup.exe           Windows CA service installer (NSIS)
+├── osh/ZTA-OSHSetup.exe         Windows OSH client installer
+└── README.md                    This file
+```
+
+---
+
+## Quick install (Linux server)
+
+`opam.sh` automates the gateway install end-to-end: provisions the Postgres
+user/db, generates the CA token, writes config, installs a systemd unit, starts
+the service, and prints an enrollment QR for AppSigner.
+
+```bash
+# Run on the gateway server
+sudo ./opam.sh install --domain gw.example.com --tls autocert
+
+# Or remote from your laptop (SSH; YubiKey-backed keys work via agent)
+./opam.sh install -i ~/.ssh/id_ed25519 -o IdentityAgent=none \
+    --domain gw.example.com --tls autocert root@gw.example.com
+```
+
+After install, `opam` is symlinked into `/usr/local/bin/`:
+
+```bash
+opam status                          # service health
+opam set-root ~/Downloads/root.cert  # bootstrap root signer (after Step 8)
+opam update                          # swap to a newer binary + restart
+opam uninstall                       # remove (with confirmation)
+```
+
+The CA service, AppSigner (iOS), and OSH client are installed separately —
+see Steps 6, 7, and 12 of the manual guide below.
+
+For full control over each piece (custom paths, hand-written config, etc.) or
+non-Linux gateway hosts, follow the 15-step manual guide.
 
 ---
 
@@ -15,7 +66,7 @@ Secure Enclave + the CA service's signing key.
 
 1. [Architecture](#architecture)
 2. [What you need before starting](#what-you-need-before-starting)
-3. [Pick a binary](#pick-a-binary)
+3. [Pick a gateway binary](#pick-a-gateway-binary)
 4. [Step 1 — Provision PostgreSQL](#step-1--provision-postgresql)
 5. [Step 2 — Generate the CA token](#step-2--generate-the-ca-token)
 6. [Step 3 — Set up APNs credentials](#step-3--set-up-apns-credentials)
@@ -41,15 +92,17 @@ Secure Enclave + the CA service's signing key.
 ```
 ┌──────────────────┐    HTTPS    ┌──────────────────┐    APNs   ┌──────────────┐
 │  OSH SSH client  │────────────>│   Gateway        │──────────>│  AppSigner   │
-│  (Go + Python)   │<────────────│   (this binary)  │<──────────│  (iOS)       │
+│                  │<────────────│                  │<──────────│  (iOS)       │
 └──────────────────┘  poll cert  └──────────────────┘ approval  └──────────────┘
-                                          │
-                                  WebSocket │ ca_sign_request
-                                          ▼
-                                  ┌──────────────────┐
-                                  │   CA service     │  (only holder of the
-                                  │   (Python)       │   SSH signing key)
-                                  └──────────────────┘
+         │                                 │
+         │ SSH                       WebSocket │ ca_sign_request
+         │  (with minted cert)              ▼
+         ▼                          ┌──────────────────┐
+┌──────────────────┐                │   CA service     │  (only holder of the
+│  Target host     │                │                  │   SSH signing key)
+│  (sshd, trusts   │                └──────────────────┘
+│   CA pubkey)     │
+└──────────────────┘
 ```
 
 End-to-end flow when a user runs `osh user@host`:
@@ -74,27 +127,27 @@ End-to-end flow when a user runs `osh user@host`:
 - **AppSigner** iOS app installed on at least one approver device
   (TestFlight or sideloaded — see Step 6)
 - **CA service** installer for the host the CA will run on
-  (sibling folder: `../ca/ZTA-CaSetup.exe` for Windows; or build from source for macOS/Linux)
-- **OSH client** for each end user (sibling folder: `../osh/ZTA-OSHSetup.exe` for Windows;
-  or build from source)
+  (`ca/ZTA-CaSetup.exe` for Windows; build from source for macOS/Linux)
+- **OSH client** for each end user
+  (`osh/ZTA-OSHSetup.exe` for Windows; build from source for macOS/Linux)
 
 ---
 
-## Pick a binary
+## Pick a gateway binary
 
-| Platform        | File                          | Architecture          |
-|-----------------|-------------------------------|-----------------------|
-| Linux x86_64    | `gateway-linux-amd64`         | ELF, statically linked |
-| Linux arm64     | `gateway-linux-arm64`         | ELF, statically linked |
-| macOS arm64     | `gateway-darwin-arm64`        | Mach-O, Apple Silicon |
-| Windows x86_64  | `gateway-windows-amd64.exe`   | PE32+                 |
+| Platform        | File                                    | Architecture          |
+|-----------------|-----------------------------------------|-----------------------|
+| Linux x86_64    | `gateway/gateway-linux-amd64`           | ELF, statically linked |
+| Linux arm64     | `gateway/gateway-linux-arm64`           | ELF, statically linked |
+| macOS arm64     | `gateway/gateway-darwin-arm64`          | Mach-O, Apple Silicon |
+| Windows x86_64  | `gateway/gateway-windows-amd64.exe`     | PE32+                 |
 
 All binaries are built from the same source with `CGO_ENABLED=0` and stripped
 (`-ldflags="-s -w"`). They have no runtime dependencies beyond the operating system.
 
 ```bash
 # Verify integrity (Linux example)
-file gateway-linux-amd64
+file gateway/gateway-linux-amd64
 # → ELF 64-bit LSB executable, x86-64, statically linked, stripped
 ```
 
@@ -167,8 +220,8 @@ Use **`use_sandbox = true`** for TestFlight / development builds of AppSigner,
 
 ## Step 4 — Configure the gateway
 
-Copy `gateway.example.toml` to `/etc/pam-zta/gateway.toml` (or wherever you like)
-and fill in the values from Steps 1-3.
+Copy `gateway/gateway.example.toml` to `/etc/pam-zta/gateway.toml` (or wherever
+you like) and fill in the values from Steps 1-3.
 
 Minimum required fields:
 
@@ -207,9 +260,8 @@ autocert_email     = "ops@example.com"
 Autocert binds `:80` (HTTP-01 challenge) and `:443` (HTTPS/WSS) — `listen_addr`
 is ignored. Make sure DNS points at your server before starting.
 
-See `gateway.example.toml` in this directory for the full annotated schema
-(includes optional `[siem]`, `[review]`, `[freeze]`, mTLS, and connection-pool
-tuning).
+See `gateway/gateway.example.toml` for the full annotated schema (includes
+optional `[siem]`, `[review]`, `[freeze]`, mTLS, and connection-pool tuning).
 
 Lock down the file:
 
@@ -224,8 +276,8 @@ sudo chown root:root /etc/pam-zta/gateway.toml
 
 ```bash
 # Make the binary executable
-chmod +x gateway-linux-amd64
-sudo install gateway-linux-amd64 /opt/pam-zta/bin/gateway
+chmod +x gateway/gateway-linux-amd64
+sudo install gateway/gateway-linux-amd64 /opt/pam-zta/bin/gateway
 
 # Run in the foreground for the first start (Ctrl-C to stop)
 sudo /opt/pam-zta/bin/gateway -config /etc/pam-zta/gateway.toml
@@ -321,7 +373,7 @@ to the gateway over WebSocket — the gateway never reaches the CA directly.
 
 | Platform | Command |
 |----------|---------|
-| Windows  | Run `../ca/ZTA-CaSetup.exe` (NSIS installer, per-user, no UAC) |
+| Windows  | Run `ca/ZTA-CaSetup.exe` (NSIS installer, per-user, no UAC) |
 | macOS    | From source: `cd ca-service/mac && bash install.sh` |
 | Linux    | From source: `cd ca-service/linux && PY=python3.12 bash install.sh` |
 
@@ -506,7 +558,7 @@ Each end user needs OSH on the machine they'll SSH from.
 
 | Platform | Source |
 |----------|--------|
-| Windows  | `../osh/ZTA-OSHSetup.exe` (sibling folder of this README) |
+| Windows  | `osh/ZTA-OSHSetup.exe` |
 | macOS    | Build from `osh/mac/` Xcode project, or `pip install -e osh/shared[mac]` from source |
 | Linux    | `go build -o ~/bin/osh ./osh/shared/cmd` from source (no installer yet) |
 
@@ -630,27 +682,6 @@ pamctl replay ~/.osh/sessions/<request-id>.cast
   `approvals`.
 
 ---
-
-## File reference
-
-This release directory contains:
-
-```
-gateway/
-├── gateway-linux-amd64           Linux x86_64 binary
-├── gateway-linux-arm64           Linux arm64 binary (Graviton, Ampere)
-├── gateway-darwin-arm64          macOS Apple Silicon binary
-├── gateway-windows-amd64.exe     Windows x86_64 binary
-├── gateway.example.toml          Annotated config template
-└── README.md                     This file
-```
-
-Sibling release artifacts:
-
-```
-../ca/ZTA-CaSetup.exe             Windows CA service installer
-../osh/ZTA-OSHSetup.exe           Windows OSH client installer
-```
 
 For source code, build instructions, and contribution guidelines, see the
 upstream repository.
