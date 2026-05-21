@@ -368,6 +368,23 @@ ensure_dirs() {
   install -d -m 0700 -o root -g root "$CONFIG_DIR"
 }
 
+ensure_prereqs() {
+  # openssl is the only critical command without a code-level fallback (token
+  # + password + self-signed cert generation). Everything else is either
+  # auto-installed (postgres family) or guaranteed present on a systemd box.
+  command -v openssl >/dev/null 2>&1 && return
+  local distro
+  distro=$(detect_distro)
+  log "Installing openssl ($distro)…"
+  case $distro in
+    debian) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssl >/dev/null ;;
+    rhel)   (command -v dnf >/dev/null && dnf install -y -q openssl >/dev/null) || yum install -y -q openssl >/dev/null ;;
+    arch)   pacman -Sy --noconfirm openssl >/dev/null ;;
+    suse)   zypper -n install -y openssl >/dev/null ;;
+    *)      err "openssl not found and unknown distro — install it manually" ;;
+  esac
+}
+
 detect_distro() {
   # Echoes one of: debian, rhel, arch, suse, unknown.
   if [[ ! -r /etc/os-release ]]; then echo unknown; return; fi
@@ -670,6 +687,7 @@ cmd_install() {
   detect_os >/dev/null
   prompt_missing
 
+  ensure_prereqs
   ensure_user
   ensure_dirs
   setup_postgres
