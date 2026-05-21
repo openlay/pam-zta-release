@@ -368,6 +368,64 @@ ensure_dirs() {
   install -d -m 0700 -o root -g root "$CONFIG_DIR"
 }
 
+detect_distro() {
+  # Echoes one of: debian, rhel, arch, suse, unknown.
+  if [[ ! -r /etc/os-release ]]; then echo unknown; return; fi
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local probe=" ${ID:-} ${ID_LIKE:-} "
+  case "$probe" in
+    *' debian '*|*' ubuntu '*) echo debian ;;
+    *' rhel '*|*' fedora '*|*' centos '*|*' rocky '*|*' almalinux '*) echo rhel ;;
+    *' arch '*) echo arch ;;
+    *' suse '*|*' opensuse '*) echo suse ;;
+    *) echo unknown ;;
+  esac
+}
+
+install_postgres() {
+  local distro
+  distro=$(detect_distro)
+  log "Installing PostgreSQL ($distro)…"
+  case $distro in
+    debian)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq postgresql postgresql-contrib >/dev/null
+      ;;
+    rhel)
+      if command -v dnf >/dev/null; then
+        dnf install -y -q postgresql-server postgresql-contrib >/dev/null
+      else
+        yum install -y -q postgresql-server postgresql-contrib >/dev/null
+      fi
+      # RHEL needs an explicit initdb before first start.
+      if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
+        if command -v postgresql-setup >/dev/null; then
+          postgresql-setup --initdb >/dev/null
+        else
+          # Older path
+          /usr/bin/postgresql-setup initdb >/dev/null 2>&1 || \
+            sudo -u postgres /usr/bin/initdb -D /var/lib/pgsql/data
+        fi
+      fi
+      ;;
+    arch)
+      pacman -Sy --noconfirm postgresql >/dev/null
+      if [[ ! -f /var/lib/postgres/data/PG_VERSION ]]; then
+        sudo -u postgres initdb -D /var/lib/postgres/data
+      fi
+      ;;
+    suse)
+      zypper -n install -y postgresql-server postgresql-contrib >/dev/null
+      ;;
+    *)
+      err "Unknown distro — install PostgreSQL manually (e.g. 'apt-get install postgresql'), then re-run."
+      ;;
+  esac
+  systemctl enable --now postgresql
+}
+
 ensure_postgres_running() {
   if command -v systemctl >/dev/null && systemctl is-active --quiet postgresql; then
     return
@@ -375,8 +433,21 @@ ensure_postgres_running() {
   if pg_isready -h "$PG_HOST" -p "$PG_PORT" >/dev/null 2>&1; then
     return
   fi
-  err "PostgreSQL is not reachable at $PG_HOST:$PG_PORT — install + start it first
-  (e.g. 'apt-get install -y postgresql' on Debian/Ubuntu, then 'systemctl start postgresql')"
+  # Not running. If we're local (127.0.0.1 / localhost) we can install it.
+  if [[ $PG_HOST == "127.0.0.1" || $PG_HOST == "localhost" ]]; then
+    install_postgres
+    # Wait up to 30s for it to come up.
+    local i
+    for i in {1..30}; do
+      if pg_isready -h "$PG_HOST" -p "$PG_PORT" >/dev/null 2>&1; then
+        ok "PostgreSQL started"
+        return
+      fi
+      sleep 1
+    done
+    err "PostgreSQL installed but didn't become ready in 30s — check 'systemctl status postgresql'"
+  fi
+  err "PostgreSQL is not reachable at $PG_HOST:$PG_PORT — install + start it on that host first."
 }
 
 setup_postgres() {
