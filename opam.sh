@@ -189,12 +189,29 @@ ensure_binary() {
 ensure_qrencode() {
   if command -v qrencode >/dev/null 2>&1; then return; fi
   log "Installing qrencode (for enrollment QR)…"
-  if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq qrencode
-  elif command -v dnf     >/dev/null; then dnf install -y -q qrencode
-  elif command -v yum     >/dev/null; then yum install -y -q qrencode
-  elif command -v apk     >/dev/null; then apk add --no-cache qrencode
-  elif command -v pacman  >/dev/null; then pacman -S --noconfirm qrencode
-  else warn "No package manager found — install qrencode manually for QR display"
+  # qrencode is non-critical (we still print the URL as plain text), so any
+  # failure here is a warning, not an exit.
+  local rc=0
+  if command -v apt-get >/dev/null; then
+    apt-get update -qq && apt-get install -y -qq qrencode || rc=$?
+  elif command -v dnf >/dev/null; then
+    # RHEL/Rocky/Fedora: qrencode lives in EPEL. Rocky 9 cloud images ship
+    # epel-release pre-installed BUT disabled (enabled=0), so we must pass
+    # --enablerepo=epel rather than relying on dnf's default repo set.
+    dnf install -y -q epel-release >/dev/null 2>&1 || true
+    dnf install -y -q --enablerepo=epel qrencode || rc=$?
+  elif command -v yum >/dev/null; then
+    yum install -y -q epel-release >/dev/null 2>&1 || true
+    yum install -y -q --enablerepo=epel qrencode || rc=$?
+  elif command -v apk     >/dev/null; then apk add --no-cache qrencode || rc=$?
+  elif command -v pacman  >/dev/null; then pacman -S --noconfirm qrencode || rc=$?
+  elif command -v zypper  >/dev/null; then zypper -n install -y qrencode || rc=$?
+  else
+    warn "No package manager found — install qrencode manually for QR display"
+    return
+  fi
+  if [[ $rc -ne 0 ]] || ! command -v qrencode >/dev/null 2>&1; then
+    warn "qrencode install failed — enrollment URL will be shown as text only"
   fi
 }
 
@@ -343,12 +360,12 @@ prompt_missing() {
   fi
 
   if [[ $SKIP_APNS -eq 0 ]]; then
-    [[ -z $APNS_TEAM    ]] && APNS_TEAM=$(prompt_default    "APNs team_id (or empty to skip)" "")
+    [[ -z $APNS_TEAM    ]] && APNS_TEAM=$(prompt_default    "APNs team_id (or empty to skip)" "4VG6UTF567")
     if [[ -z $APNS_TEAM ]]; then SKIP_APNS=1; warn "APNs disabled — approvals via push won't work"
     else
       [[ -z $APNS_KEY_ID   ]] && APNS_KEY_ID=$(prompt_default   "APNs key_id" "")
       [[ -z $APNS_KEY_PATH ]] && APNS_KEY_PATH=$(prompt_default "Path to APNs .p8 file" "")
-      [[ -z $APNS_TOPIC    ]] && APNS_TOPIC=$(prompt_default    "APNs topic (iOS bundle id)" "com.example.appsigner")
+      [[ -z $APNS_TOPIC    ]] && APNS_TOPIC=$(prompt_default    "APNs topic (iOS bundle id)" "com.pamzta.appsigner")
       [[ -f $APNS_KEY_PATH ]] || err "APNs .p8 file not found: $APNS_KEY_PATH"
     fi
   fi
@@ -365,7 +382,9 @@ ensure_user() {
 ensure_dirs() {
   install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
   install -d -m 0755 "$BIN_DIR"
-  install -d -m 0700 -o root -g root "$CONFIG_DIR"
+  # 0750 root:pamzta — group needs +x (traverse) so the service user can
+  # open the config files inside. Individual files stay 0640 root:pamzta.
+  install -d -m 0750 -o root -g "$SERVICE_USER" "$CONFIG_DIR"
 }
 
 ensure_prereqs() {
@@ -473,7 +492,10 @@ setup_postgres() {
   log "Provisioning Postgres user '$PG_USER' and database '$PG_DB'…"
   # Run as the postgres OS user (typical Debian/Ubuntu/RHEL setup)
   local sql
+  # Force scram-sha-256 hashing — PG 13 still defaults password_encryption to
+  # md5, which would break our pg_hba scram-sha-256 rule below.
   sql=$(cat <<EOF
+SET password_encryption = 'scram-sha-256';
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$PG_USER') THEN
@@ -496,6 +518,28 @@ EOF
   fi
   install -m 0600 -o root -g root /dev/null "$CONFIG_DIR/.pgpass"
   echo "$PG_HOST:$PG_PORT:*:$PG_USER:$PG_PASSWORD" > "$CONFIG_DIR/.pgpass"
+
+  # RHEL/Rocky default pg_hba.conf uses `ident` for local TCP, which rejects
+  # password auth (gateway sends a literal password). Inject a password rule
+  # for our user at the top so it takes precedence over the default `ident`.
+  if id postgres >/dev/null 2>&1; then
+    local hba
+    hba=$(sudo -u postgres psql -tAc "SHOW hba_file" 2>/dev/null | tr -d ' ')
+    if [[ -n $hba && -f $hba ]] && ! grep -q "^# pam-zta managed" "$hba"; then
+      log "Updating $hba for $PG_USER password auth…"
+      local tmp
+      tmp=$(mktemp)
+      {
+        echo "# pam-zta managed — allow $PG_USER from localhost via password"
+        echo "host  $PG_DB  $PG_USER  127.0.0.1/32  scram-sha-256"
+        echo "host  $PG_DB  $PG_USER  ::1/128       scram-sha-256"
+        cat "$hba"
+      } > "$tmp"
+      install -m 0600 -o postgres -g postgres "$tmp" "$hba"
+      rm -f "$tmp"
+      systemctl reload postgresql || systemctl restart postgresql
+    fi
+  fi
   ok "Postgres ready ($PG_USER@$PG_HOST:$PG_PORT/$PG_DB)"
 }
 
@@ -505,7 +549,9 @@ generate_self_signed_cert() {
   TLS_KEY=$CONFIG_DIR/server.key
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_KEY" -out "$TLS_CERT" \
     -days 365 -subj "/CN=$DOMAIN" 2>/dev/null
-  chmod 0600 "$TLS_KEY" "$TLS_CERT"
+  # Gateway runs as $SERVICE_USER and must read both halves to terminate TLS.
+  chmod 0640 "$TLS_KEY" "$TLS_CERT"
+  chown "root:$SERVICE_USER" "$TLS_KEY" "$TLS_CERT"
 }
 
 install_binary() {
@@ -557,7 +603,10 @@ tls_key  = \"$TLS_KEY\""
 
   local ca_token
   ca_token=$(openssl rand -hex 32)
-  echo "$ca_token" | install -m 0600 -o root -g root /dev/stdin "$CONFIG_DIR/ca.token"
+  # 0640 root:pamzta — the gateway service runs as pamzta and must be able
+  # to read this file. The directory /etc/pam-zta/ stays 0700 root:root so
+  # nothing outside the service user can list secrets.
+  echo "$ca_token" | install -m 0640 -o root -g "$SERVICE_USER" /dev/stdin "$CONFIG_DIR/ca.token"
 
   log "Writing config to $CONFIG_DIR/gateway.toml"
   cat > "$CONFIG_DIR/gateway.toml" <<EOF
@@ -584,8 +633,9 @@ $apns_block
 soft_timeout = "30s"
 hard_timeout = "120s"
 EOF
-  chmod 0600 "$CONFIG_DIR/gateway.toml"
-  chown root:root "$CONFIG_DIR/gateway.toml"
+  # 0640 root:pamzta — see ca.token note above.
+  chmod 0640 "$CONFIG_DIR/gateway.toml"
+  chown "root:$SERVICE_USER" "$CONFIG_DIR/gateway.toml"
 }
 
 write_systemd_unit() {
