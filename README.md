@@ -373,7 +373,7 @@ Secure Enclave (P-256, Touch ID required per signature).
 
 Distribution options:
 
-- **TestFlight** — your iOS dev team uploads a build, then invites approvers via email
+- **TestFlight** — join the public beta: <https://testflight.apple.com/join/efAqUZAk>
 - **Ad-hoc / Enterprise** — sideload via Xcode (signer/AppSigner/AppSigner.xcodeproj)
 
 On first launch:
