@@ -33,18 +33,9 @@ This release repo contains:
 ## Get the release
 
 The release artifacts live at <https://github.com/openlay/pam-zta-release>.
-Pick whichever transport is easiest:
+Fetch `opam.sh` and let it download the gateway binary on demand:
 
 ```bash
-# Option 1 — git clone (preferred; works for both local and remote install paths)
-git clone https://github.com/openlay/pam-zta-release.git
-cd pam-zta-release
-
-# Option 2 — tarball (no git required)
-curl -sL https://github.com/openlay/pam-zta-release/archive/refs/heads/main.tar.gz \
-  | tar xz && cd pam-zta-release-main
-
-# Option 3 — script-only fast path (downloads gateway binary on demand)
 curl -fsSL https://raw.githubusercontent.com/openlay/pam-zta-release/main/opam.sh \
   -o opam.sh && chmod +x opam.sh
 sudo ./opam.sh install --domain gw.example.com --tls autocert
