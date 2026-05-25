@@ -1,15 +1,13 @@
 # pam-zta Gateway Control — configuration
 #
 # Install to /etc/pam-zta/gateway.toml (mode 0600, owned by root).
-# Systemd unit only needs:
-#   ExecStart=/opt/pam-zta/bin/gateway -config /etc/pam-zta/gateway.toml
+# Systemd unit only needs:  ExecStart=/opt/pam-zta/bin/gateway -config /etc/pam-zta/gateway.toml
 
 [server]
-# HTTP listen address. Ignored when autocert_domain is set
-# (autocert always binds :80 + :443).
+# HTTP listen address. Ignored when autocert_domain is set (autocert always binds :80 + :443).
 listen_addr = ":8443"
 
-# Manual TLS — leave empty to use plain HTTP (dev only) or autocert below.
+# Manual TLS (leave empty to use plain HTTP or autocert below).
 tls_cert = ""
 tls_key  = ""
 
@@ -20,52 +18,49 @@ autocert_cache_dir = "/var/lib/pam-zta/autocert-cache"
 autocert_email     = ""
 
 [ca]
-# Shared bearer token that the CA Service must present on /v1/ca/ws WebSocket.
+# Shared bearer token that the CA Service must present on the /v1/ca/ws WebSocket.
 # Generate with:  openssl rand -hex 32
-# Paste the SAME value into ca_service.toml on the CA host.
-#
 # The CA token is only a transport-layer secret — the actual security of the
 # system comes from the per-request approval-chain signatures verified by the
-# CA against its AdminKeyStore (root cert imported during bootstrap).
+# CA against its AdminKeyStore.
 token = ""
 
-# Optional mTLS for CA WebSocket. If set, CA must present a client cert
-# signed by tls_ca. Leave empty for token-only auth.
-tls_cert = ""
-tls_key  = ""
-tls_ca   = ""
-
-[database]
-# PostgreSQL connection (gateway auto-creates schema on first start).
-# All 6 tables — ledger + devices + signers + servers + rules + approvals —
-# live in this single database, accessed via one connection pool.
-host                  = "127.0.0.1"
-port                  = 5432
-user                  = "pamzta"
-password              = ""              # load from env in production
-dbname                = "pamzta"
-sslmode               = "disable"       # or "require" / "verify-full" in prod
-max_open_conns        = 50
-max_idle_conns        = 25
-conn_max_lifetime_min = 30
+[ledger]
+db_path = "/var/lib/pam-zta/gateway_ledger.db"
 
 [cert]
 # Issued SSH user certificate lifetime (seconds).
-# Short TTLs are recommended — the gateway re-mints per session, not per host.
 ttl = 300
 
-# NOTE: The gateway holds NO signing key.
+# NOTE: The gateway holds NO role-granting signing key.
 # All roles (root, super_admin, admin, user_device) are held by iOS signers
 # (Secure Enclave P-256 or Ed25519). Root trust is established by importing
-# a root identity cert into the CA Service trust store — see Step 8 in README.
+# a root identity cert into the CA Service trust store — see
+# ca-service/root_certs/ for details.
+#
+# The [gateway_key] section below configures a SEPARATE identity key used
+# only to sign outbound data for audit non-repudiation — it grants no
+# privileges. Downstream components (CA, signer, OSH, SIEM) verify it to
+# attest which gateway processed each payload.
+
+[gateway_key]
+# File backend path. Auto-generated on first start with 0600 perms.
+# Ignored when TPM 2.0 is available (and tpm_disabled = false).
+key_path = "/var/lib/pam-zta/gateway_key.pem"
+
+# Force file backend even when TPM is available. Useful on dev machines.
+tpm_disabled = false
+
+# Refuse to start if TPM is unavailable. Use in production where the
+# operator has committed to TPM-backed gateway identity.
+tpm_required = false
 
 [apns]
 # Apple Push Notification service. All four fields must be set to enable
 # approval-request push notifications to iOS devices running AppSigner.
-#   team_id  — Apple Developer Team ID (e.g. "ABC123XY")
-#   key_id   — APNs Auth Key ID from https://developer.apple.com/account
-#   key_path — path to the .p8 file downloaded from APNs Auth Keys page
-#   topic    — iOS bundle ID of AppSigner
+# Get team_id + key_id from https://developer.apple.com/account
+# key_path is the .p8 file downloaded from the APNs Auth Keys page.
+# topic is the iOS bundle ID.
 team_id     = ""
 key_id      = ""
 key_path    = ""
@@ -73,22 +68,5 @@ topic       = "com.example.appsigner"
 use_sandbox = false   # true for TestFlight / development builds
 
 [freeze]
-# Circuit breaker for incident response.
-# soft_timeout: warn but allow new requests
-# hard_timeout: block all new requests
 soft_timeout = "30s"
 hard_timeout = "120s"
-
-[siem]
-# Optional SIEM event forwarding.
-# url        — internal endpoint the gateway writes events to
-# public_url — public URL clients use for log retrieval (shown in OSH)
-url        = ""
-public_url = ""
-
-[review]
-# Optional App Store review token. If set, an iOS signer registering with
-# this token is auto-approved at admin role — useful for App Store reviewers.
-# Generate with:  openssl rand -hex 16
-# Leave empty in production.
-token = ""
